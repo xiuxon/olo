@@ -1,0 +1,82 @@
+name: Forcewall Test (emulator, hard-force E2E)
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: pc-share release tag (blank = latest)
+        required: false
+        default: ''
+      asset:
+        description: release asset built from pcshare-forcewall config
+        required: false
+        default: 'forcewall-test.apk'
+permissions:
+  contents: read
+jobs:
+  forcewall:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Download APK
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG=$(gh api repos/nilow9950/pc-share/releases/latest --jq .tag_name </dev/null); fi
+          echo "tag=$TAG"
+          mkdir -p apks
+          gh release download "$TAG" --repo nilow9950/pc-share --pattern "${{ github.event.inputs.asset }}" --dir apks </dev/null
+          ls -l apks
+          sha256sum apks/*
+      - name: Install + wall assertions
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 30
+          arch: x86_64
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -x
+            adb wait-for-device
+            adb shell getprop ro.build.version.sdk
+            adb shell input keyevent 82 || true
+            adb uninstall com.nextec.pcshare || true
+            sleep 2
+            adb install -r "apks/${{ github.event.inputs.asset }}" || true
+            sleep 2
+            adb logcat -c || true
+            adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true
+            sleep 15
+            adb shell pidof com.nextec.pcshare && echo FORCEWALL_APP_ALIVE || echo FORCEWALL_APP_DEAD
+            adb shell uiautomator dump /sdcard/fw1.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/fw1.xml fw1.xml >/dev/null 2>&1 || true
+            grep -q "HARD WALL TEST" fw1.xml && echo FORCEWALL_SHOWN_OK || echo FORCEWALL_SHOWN_MISSING
+            grep -q "UPDATE NOW" fw1.xml && echo FORCEWALL_BTN_OK || echo FORCEWALL_BTN_MISSING
+            adb logcat -d -s AndroidRuntime:E | tail -n 30 || true
+            adb shell input keyevent KEYCODE_BACK || true
+            sleep 3
+            adb shell uiautomator dump /sdcard/fw2.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/fw2.xml fw2.xml >/dev/null 2>&1 || true
+            grep -q "HARD WALL TEST" fw2.xml && echo FORCEWALL_BACK_BLOCKED_OK || echo FORCEWALL_BACK_CLOSED_FAIL
+            adb shell pidof com.nextec.pcshare && echo FORCEWALL_ALIVE2 || echo FORCEWALL_DEAD2
+            B=$(grep -o 'text="UPDATE NOW"[^>]*bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"' fw1.xml || true); if [ -n "$B" ]; then set -- $(echo "$B" | grep -o '[0-9]\+'); adb shell input tap $(( ($1+$3)/2 )) $(( ($2+$4)/2 )); echo FORCEWALL_TAP_SENT; else echo FORCEWALL_TAP_PARSE_FAIL; fi
+            sleep 5
+            adb shell input keyevent KEYCODE_BACK || true
+            sleep 2
+            adb shell input keyevent KEYCODE_BACK || true
+            sleep 2
+            adb shell uiautomator dump /sdcard/fw3.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/fw3.xml fw3.xml >/dev/null 2>&1 || true
+            grep -q "HARD WALL TEST" fw3.xml && echo FORCEWALL_SURVIVES_TAP_OK || echo FORCEWALL_DISMISSED_FAIL
+            grep -q "UPDATE NOW" fw3.xml && echo FORCEWALL_BTN_ALIVE_OK || echo FORCEWALL_BTN_GONE
+            adb shell pidof com.nextec.pcshare && echo FORCEWALL_ALIVE3 || echo FORCEWALL_DEAD3
+            adb logcat -d | grep -E "FATAL|secureapp|AssertionError|NoClassDefFound|VerifyError" | tail -n 40 || true
+            echo "== sa_integ =="
+            adb shell 'cat /data/data/com.nextec.pcshare/files/sa_integ.txt 2>/dev/null | head -n 25' || true
+            echo FORCEWALL_TEST_DONE

@@ -1,0 +1,191 @@
+name: Build Secure APK (via Kosua)
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: 'config name (config/<name>.json in secure-app)'
+        required: false
+        default: 'pcshare'
+      tag:
+        description: 'source release tag (blank = latest)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  secure:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout secure-app (private)
+        uses: actions/checkout@v4
+        with:
+          repository: nilow9950/secure-app
+          token: ${{ secrets.XBOX_REPO_TOKEN }}
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Restore keystore
+        run: echo "$XBOX_KEYSTORE_B64" | base64 -d > /tmp/keystore.jks
+        env:
+          XBOX_KEYSTORE_B64: ${{ secrets.XBOX_KEYSTORE_B64 }}
+
+      - name: Fetch tools (apktool + R8 + dex2jar + SDK paths)
+        run: |
+          set -e
+          curl -sL -o /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+          curl -sL -o /tmp/r8.jar https://dl.google.com/dl/android/maven2/com/android/tools/r8/8.3.37/r8-8.3.37.jar
+          curl -sL -o /tmp/dex-tools.zip https://github.com/pxb1988/dex2jar/releases/download/v2.4/dex-tools-v2.4.zip
+          unzip -q /tmp/dex-tools.zip -d /tmp/d2j
+          chmod +x /tmp/d2j/dex-tools-v2.4/d2j-dex2jar.sh
+          ls -l /tmp/apktool.jar /tmp/r8.jar /tmp/d2j/dex-tools-v2.4/d2j-dex2jar.sh
+          AJ=$(ls "$ANDROID_HOME"/platforms/android-*/android.jar | sort -V | tail -1)
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)
+          echo "ANDROID_JAR=$AJ" >> "$GITHUB_ENV"
+          echo "APKSIGNER=${BT}apksigner" >> "$GITHUB_ENV"
+          echo "ZIPALIGN=${BT}zipalign" >> "$GITHUB_ENV"
+          echo "DEX2JAR=/tmp/d2j/dex-tools-v2.4/d2j-dex2jar.sh" >> "$GITHUB_ENV"
+          echo "using $AJ / $BT"
+
+      - name: Android NDK (pack libpk.so - only when config has pack.enabled)
+        run: |
+          set -e
+          PACK=$(python3 -c "import json,sys;print(bool((json.load(open(sys.argv[1])).get('pack') or {}).get('enabled')))" "config/${{ inputs.app }}.json")
+          if [ "$PACK" != "True" ]; then echo "pack disabled - skip NDK"; exit 0; fi
+          FOUND=""
+          for d in ${ANDROID_NDK_HOME:-} ${ANDROID_NDK_ROOT:-} ${ANDROID_NDK:-} ${ANDROID_NDK_LATEST_HOME:-} "$ANDROID_HOME"/ndk/*; do
+            [ -n "$d" ] && [ -d "$d" ] || continue
+            if [ -x "$d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang" ]; then FOUND="$d"; fi
+          done
+          if [ -z "$FOUND" ]; then
+            echo "no preinstalled NDK - installing ndk;27.0.12077973"
+            yes | sdkmanager --install "ndk;27.0.12077973" >/dev/null 2>&1 || true
+            for d in "$ANDROID_HOME"/ndk/*; do
+              [ -x "$d/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang" ] && FOUND="$d"
+            done
+          fi
+          [ -n "$FOUND" ] || { echo "NDK setup failed - pack needs clang"; exit 1; }
+          echo "ANDROID_NDK_HOME=$FOUND" >> "$GITHUB_ENV"
+          echo "NDK: $FOUND"
+
+      - name: Fetch plain APK
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          python3 tools/fetch.py --config "config/${{ inputs.app }}.json" \
+            --out /tmp/plain.apk --tag "${{ inputs.tag }}" --tagfile /tmp/src_tag.txt
+
+      - name: Fetch plain bundle (AAB configs only)
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          eval "$(python3 -c "
+          import json
+          c = json.load(open('config/${{ inputs.app }}.json'))
+          print('OUT_AAB=%s' % ('1' if c['output']['asset'].endswith('.aab') else '0'))
+          print('AAB_ASSET=%s' % c['input'].get('aab_asset', ''))
+          ")"
+          if [ "$OUT_AAB" != "1" ]; then echo "apk output - skip bundle fetch"; exit 0; fi
+          [ -n "$AAB_ASSET" ] || { echo "input.aab_asset missing in config"; exit 1; }
+          # same tag as the apk -> plain apk + plain bundle from ONE release
+          python3 tools/fetch.py --config "config/${{ inputs.app }}.json" \
+            --out /tmp/plain.aab --tag "$(cat /tmp/src_tag.txt)" --asset "$AAB_ASSET"
+
+      - name: Harden (guard + strings + obfuscate)
+        env:
+          XBOX_STORE_PASS: ${{ secrets.XBOX_STORE_PASS }}
+          XBOX_KEY_ALIAS: ${{ secrets.XBOX_KEY_ALIAS }}
+          LOG_KEY: ${{ secrets.PCSHARE_LOG_KEY }}
+        run: |
+          EXTRA=""
+          if [ -f /tmp/plain.aab ]; then EXTRA="--aab /tmp/plain.aab --out-aab /tmp/play.aab"; fi
+          python3 tools/harden.py --config "config/${{ inputs.app }}.json" \
+            --apk /tmp/plain.apk --out /tmp/secure.apk \
+            --apktool /tmp/apktool.jar --r8 /tmp/r8.jar --dex2jar "$DEX2JAR" \
+            --android-jar "$ANDROID_JAR" \
+            --zipalign "$ZIPALIGN" --apksigner "$APKSIGNER" \
+            --keystore /tmp/keystore.jks --ks-pass "$XBOX_STORE_PASS" \
+            --alias "$XBOX_KEY_ALIAS" $EXTRA
+
+      - name: Verify hardened APK (+ bundle when built)
+        run: |
+          ARGS=""
+          if [ -f /tmp/secure.apk.pkkey ]; then ARGS="--pk-key-file /tmp/secure.apk.pkkey"; fi
+          python3 tools/verify.py --apk /tmp/secure.apk \
+            --config "config/${{ inputs.app }}.json" $ARGS
+          if [ -f /tmp/play.aab ]; then
+            python3 tools/verify.py --apk /tmp/play.aab \
+              --config "config/${{ inputs.app }}.json"
+          fi
+
+      - name: Upload hardened output to release
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          TAG=$(cat /tmp/src_tag.txt)
+          eval "$(python3 -c "
+          import json
+          c = json.load(open('config/${{ inputs.app }}.json'))['output']
+          print('OUT_REPO=%s' % c['repo'])
+          print('OUT_ASSET=%s' % c['asset'])
+          ")"
+          if [ "${OUT_ASSET##*.}" = "aab" ]; then SRC=/tmp/play.aab; else SRC=/tmp/secure.apk; fi
+          [ -f "$SRC" ] || { echo "expected output missing: $SRC"; exit 1; }
+          cp "$SRC" "/tmp/$OUT_ASSET"
+          ls -l "/tmp/$OUT_ASSET"
+          gh release upload "$TAG" "/tmp/$OUT_ASSET" --repo "$OUT_REPO" --clobber
+          echo "uploaded $OUT_ASSET to $OUT_REPO@$TAG"
+          # Deobfuscation map for Play Console. Prefer pipeline R8 mapping;
+          # when obfuscate is disabled the app dex names come from AGP minify
+          # of the plain build — fall back to that mapping on the same tag.
+          if [ -f /tmp/secure.apk.mapping.txt ]; then
+            cp /tmp/secure.apk.mapping.txt "/tmp/$OUT_ASSET.mapping.txt"
+            gh release upload "$TAG" "/tmp/$OUT_ASSET.mapping.txt" --repo "$OUT_REPO" --clobber
+            echo "uploaded $OUT_ASSET.mapping.txt (pipeline R8 map)"
+          elif [ "${OUT_ASSET##*.}" = "aab" ]; then
+            if gh release download "$TAG" --repo "$OUT_REPO" \
+                --pattern "PC-Share.aab.mapping.txt" --dir /tmp/agpmap 2>/dev/null \
+                && [ -f /tmp/agpmap/PC-Share.aab.mapping.txt ]; then
+              cp /tmp/agpmap/PC-Share.aab.mapping.txt "/tmp/$OUT_ASSET.mapping.txt"
+              gh release upload "$TAG" "/tmp/$OUT_ASSET.mapping.txt" --repo "$OUT_REPO" --clobber
+              echo "uploaded $OUT_ASSET.mapping.txt (AGP minify map from plain build)"
+            else
+              echo "WARN: no mapping available for $OUT_ASSET (Play crash stacks will be obfuscated)"
+            fi
+          else
+            echo "NOTE: pipeline R8 skipped (obfuscate off) - no secure APK mapping"
+          fi
+
+  purge-kosua-logs:
+    runs-on: ubuntu-latest
+    needs: [secure]
+    if: ${{ needs.secure.result == 'success' }}
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete all Kosua workflow runs (logs)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          REPO="$GITHUB_REPOSITORY"
+          gh api --paginate "repos/$REPO/actions/runs?per_page=100" \
+            --jq '.workflow_runs[].id' > /tmp/run_ids.txt || true
+          while read -r id; do
+            [ -z "$id" ] && continue
+            echo "deleting run $id"
+            gh api -X DELETE "repos/$REPO/actions/runs/$id" || true
+          done < /tmp/run_ids.txt
+          gh api -X DELETE "repos/$REPO/actions/runs/$GITHUB_RUN_ID" || true
+          echo "purge done"

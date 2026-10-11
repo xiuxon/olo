@@ -1,0 +1,125 @@
+name: Update-over-old-release test (emulator)
+on:
+  workflow_dispatch:
+    inputs:
+      new_tag:
+        description: NEW pc-share release tag (blank = latest)
+        required: false
+        default: ''
+      old4_tag:
+        description: OLD secure tag with versionCode 4
+        required: false
+        default: 'apk-20261010-054607'
+      old5_tag:
+        description: OLD secure tag with versionCode 5 (same-vc dexfp path)
+        required: false
+        default: 'apk-20261010-095339'
+permissions:
+  contents: read
+jobs:
+  updatetest:
+    runs-on: ubuntu-latest
+    env:
+      LOG_KEY: ${{ secrets.PCSHARE_LOG_KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [30]
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Download APKs
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          TAGN="${{ github.event.inputs.new_tag }}"
+          if [ -z "$TAGN" ]; then TAGN=$(gh api repos/nilow9950/pc-share/releases/latest --jq .tag_name </dev/null); fi
+          TAG4="${{ github.event.inputs.old4_tag }}"
+          TAG5="${{ github.event.inputs.old5_tag }}"
+          echo "new=$TAGN old4=$TAG4 old5=$TAG5"
+          mkdir -p apks/old4 apks/old5 apks/new
+          gh release download "$TAG4" --repo nilow9950/pc-share --pattern 'PC-Share-secure.apk' --dir apks/old4 </dev/null
+          gh release download "$TAG5" --repo nilow9950/pc-share --pattern 'PC-Share-secure.apk' --dir apks/old5 </dev/null
+          gh release download "$TAGN" --repo nilow9950/pc-share --pattern 'PC-Share-secure.apk' --dir apks/new </dev/null
+          ls -l apks/*/*.apk
+          sha256sum apks/*/*.apk
+      - name: Install log decrypt helper
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          python3 -c "import cryptography" 2>/dev/null || { pip install --quiet cryptography || pip install --quiet --break-system-packages cryptography; }
+          python3 -c "import cryptography" >/dev/null 2>&1 && echo "cryptography OK" || { echo "cryptography MISSING"; exit 1; }
+          curl -fsSL -H "Authorization: token $GH_TOKEN" \
+            https://raw.githubusercontent.com/nilow9950/secure-app/main/tools/decrypt_log.py \
+            -o /tmp/sa_dec.py && echo "decrypt helper fetched" || { echo "decrypt helper fetch FAILED"; exit 1; }
+          cat > /tmp/gs.sh <<'EOF'
+          #!/bin/sh
+          # gs.sh <integ|crash|/path> <cmd...>
+          case "$1" in
+            integ) R='/data/data/com.nextec.pcshare/files/sa_integ.txt' ;;
+            crash) R='/data/data/com.nextec.pcshare/cache/Crash Reports/sa_crash.txt' ;;
+            *)     R="$1" ;;
+          esac
+          shift
+          rm -f /tmp/gs_raw /tmp/gs_txt
+          if ! adb pull "$R" /tmp/gs_raw >/dev/null 2>&1; then
+            echo "(missing: $R)"
+            exit 1
+          fi
+          if ! python3 /tmp/sa_dec.py /tmp/gs_raw > /tmp/gs_txt; then
+            echo "(decrypt failed: $R)"
+            exit 1
+          fi
+          exec "$@" /tmp/gs_txt
+          EOF
+          chmod +x /tmp/gs.sh
+          echo "LOG_KEY set: $([ -n "$LOG_KEY" ] && echo yes || echo NO)"
+          sh -n /tmp/gs.sh && echo "gs.sh syntax OK"
+      - name: Install + update legs + capture
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -x
+            adb wait-for-device
+            adb shell getprop ro.build.version.sdk
+            adb shell input keyevent 82 || true
+            echo "======== LEG A: old vc4 secure -> new vc5 secure (versionCode CHANGES -> rebaseline path) ========"
+            adb install apks/old4/PC-Share-secure.apk && echo OLD4_INSTALLED || echo OLD4_INSTALL_FAIL
+            adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo OLD4_OK || echo OLD4_DEAD
+            adb shell dumpsys package com.nextec.pcshare | grep -E "versionCode|versionName" || true
+            echo "-- sa_integ after OLD4 first open:"; /tmp/gs.sh integ cat || true
+            adb install -r apks/new/PC-Share-secure.apk && echo UPD_4to5_INSTALLED || echo UPD_4to5_INSTALL_FAIL
+            adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo UPD_4to5_OK || echo UPD_4to5_DEAD
+            adb shell dumpsys package com.nextec.pcshare | grep -E "versionCode|versionName" || true
+            adb logcat -d -s AndroidRuntime:E | tail -n 40 || true
+            adb logcat -d | grep -E "FATAL|AssertionError|secureapp" | tail -n 30 || true
+            echo "-- sa_integ after 4to5 update open:"; /tmp/gs.sh integ cat || true
+            echo "======== LEG B: old vc5 secure -> new vc5 secure (SAME versionCode -> dexfp path = prime suspect) ========"
+            adb uninstall com.nextec.pcshare || true; sleep 2
+            adb install apks/old5/PC-Share-secure.apk && echo OLD5_INSTALLED || echo OLD5_INSTALL_FAIL
+            adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo OLD5_OK || echo OLD5_DEAD
+            adb shell dumpsys package com.nextec.pcshare | grep -E "versionCode|versionName" || true
+            echo "-- sa_integ after OLD5 first open (baseline art= should be recorded):"; /tmp/gs.sh integ cat || true
+            adb install -r apks/new/PC-Share-secure.apk && echo UPD_5to5_INSTALLED || echo UPD_5to5_INSTALL_FAIL
+            adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo UPD_5to5_OK || echo UPD_5to5_DEAD
+            adb shell dumpsys package com.nextec.pcshare | grep -E "versionCode|versionName" || true
+            adb logcat -d -s AndroidRuntime:E | tail -n 60 || true
+            adb logcat -d | grep -E "FATAL|AssertionError|secureapp|dex2oat" | tail -n 60 || true
+            echo "-- sa_integ after 5to5 update open:"; /tmp/gs.sh integ cat || true
+            echo "-- sa_crash after 5to5 update open:"; /tmp/gs.sh crash cat || true
+            adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo SECOND_5to5_OK || echo SECOND_5to5_DEAD
+            adb logcat -d -s AndroidRuntime:E | tail -n 40 || true
+            echo "-- sa_integ after 5to5 second open:"; /tmp/gs.sh integ cat || true
+            adb shell 'dumpsys package com.nextec.pcshare | grep -iA3 dexopt' || true
+            adb shell 'ls -la /data/app/*/com.nextec.pcshare*/oat/*/ 2>/dev/null' || true
+            adb shell 'cat /data/data/com.nextec.pcshare/shared_prefs/sa_integ.xml 2>/dev/null' || true

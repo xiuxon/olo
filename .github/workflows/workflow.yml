@@ -1,0 +1,185 @@
+name: Real Test - Local Model + Webhook Trigger
+
+on:
+  # Triggered remotely by the Cloudflare Worker on every Telegram message
+  repository_dispatch:
+    types: [telegram-message]
+  # Also keep manual trigger for direct testing without the Worker
+  workflow_dispatch:
+    inputs:
+      run_minutes:
+        description: 'How many minutes to keep the server up'
+        required: false
+        default: '10'
+      # model_url is intentionally NOT hardcoded here - it comes from a repo Variable
+      # (AD) so the model choice isn't visible in this file.
+
+concurrency:
+  group: telegram-bot-session
+  cancel-in-progress: false
+
+jobs:
+  run-local-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code from Osua (source repo)
+        uses: actions/checkout@v4
+        with:
+          repository: nilow9950/Osua
+          token: ${{ secrets.REPO_A }}
+
+      - name: Show runner specs
+        run: |
+          nproc
+          free -h
+          df -h /
+
+      # ---------------------------------------------------------------
+      # Cache 1: GGUF model (big download, rarely changes)
+      # ---------------------------------------------------------------
+      - name: Cache GGUF model
+        id: cache-model
+        uses: actions/cache@v4
+        with:
+          path: model.gguf
+          key: model-cache-qwen2.5-coder-1.5b-q4km
+
+      - name: Download model (if not cached)
+        if: steps.cache-model.outputs.cache-hit != 'true'
+        env:
+          MODEL_URL: ${{ vars.AD }}
+        run: |
+          curl -L -o model.gguf "$MODEL_URL"
+
+      # ---------------------------------------------------------------
+      # Cache 2: llama.cpp server binary
+      # ---------------------------------------------------------------
+      - name: Cache llama.cpp server binary
+        id: cache-llama-bin
+        uses: actions/cache@v4
+        with:
+          path: llama_bin
+          key: llama-cpp-b10456-ubuntu-x64
+
+      - name: Download llama.cpp server binary (if not cached)
+        if: steps.cache-llama-bin.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o llama.tar.gz https://github.com/ggml-org/llama.cpp/releases/download/b10456/llama-b10456-bin-ubuntu-x64.tar.gz
+          mkdir -p llama_bin
+          tar -xzf llama.tar.gz -C llama_bin
+
+      - name: Ensure llama-server is executable
+        run: |
+          find llama_bin -name "llama-server" -exec chmod +x {} \;
+
+      - name: Start llama-server (OpenAI-compatible, local, in background)
+        run: |
+          BINARY=$(find llama_bin -name "llama-server" | head -1)
+          nohup $BINARY -m model.gguf --host 127.0.0.1 --port 1234 -t $(nproc) --jinja --flash-attn auto --ctx-size 32768 > llama-server.log 2>&1 &
+          echo "Waiting for llama-server to boot..."
+          for i in $(seq 1 30); do
+            curl -s http://127.0.0.1:1234/v1/models > /dev/null && break
+            sleep 2
+          done
+          curl -s http://127.0.0.1:1234/v1/models || echo "WARNING: llama-server did not respond in time"
+
+      # ---------------------------------------------------------------
+      # Cache 3: Node.js + global npm packages (Claude Code CLI)
+      # ---------------------------------------------------------------
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache npm global packages (Claude Code CLI)
+        id: cache-npm-global
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm-global
+          key: npm-global-claude-code-${{ runner.os }}
+
+      - name: Configure npm global prefix
+        run: |
+          mkdir -p ~/.npm-global
+          npm config set prefix "~/.npm-global"
+          echo "~/.npm-global/bin" >> $GITHUB_PATH
+
+      - name: Install Claude Code CLI (if not cached)
+        if: steps.cache-npm-global.outputs.cache-hit != 'true'
+        run: |
+          npm install -g @anthropic-ai/claude-code
+
+      - name: Verify Claude Code CLI
+        run: |
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          claude --version
+
+      - name: Pre-accept Claude Code onboarding (non-interactive)
+        env:
+          ANTHROPIC_API_KEY: sk-placeholder-key-for-proxy
+        run: |
+          mkdir -p ~/.claude
+          echo '{"hasCompletedOnboarding": true}' > ~/.claude/config.json || true
+
+      # ---------------------------------------------------------------
+      # Cache 4: uv-managed Python venv + deps
+      # ---------------------------------------------------------------
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - run: uv python install
+
+      - name: Cache uv virtualenv
+        id: cache-venv
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          key: uv-venv-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+
+      - run: uv sync
+
+      - name: Write .env (local model - NO Groq key needed)
+        env:
+          LOCAL_MODEL_ID: ${{ vars.LAD }}
+        run: |
+          cat > .env << EOF
+          # No GROQ_API_KEY - using local llama-server via lmstudio-compatible provider
+          LM_STUDIO_BASE_URL="http://127.0.0.1:1234/v1"
+          MODEL="lmstudio/${LOCAL_MODEL_ID}"
+
+          SERPER_API_KEY="${{ secrets.KEY }}"
+
+          MESSAGING_PLATFORM="telegram"
+          TELEGRAM_BOT_TOKEN="${{ secrets.TH_TOKEN }}"
+          ALLOWED_TELEGRAM_USER_ID="${{ vars.IK }}"
+
+          CLAUDE_WORKSPACE="./agent_workspace"
+          ALLOWED_DIR="$(pwd)"
+
+          PROVIDER_RATE_LIMIT="15"
+          PROVIDER_RATE_WINDOW="60"
+          EOF
+
+      - name: Run bot server for a limited window
+        run: |
+          export PATH="$HOME/.npm-global/bin:$PATH"
+          MINUTES="${{ github.event.inputs.run_minutes || '10' }}"
+          SECONDS=$((MINUTES * 60))
+          echo "Bot server starting, auto-stop after ${MINUTES} min..."
+          echo "Triggered by: ${{ github.event_name }}"
+          timeout ${SECONDS}s uv run uvicorn server:app --host 0.0.0.0 --port 8082 || true
+
+      - name: Show logs + resource summary
+        if: always()
+        run: |
+          echo "## Local Model + Webhook Test Result" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          free -h >> $GITHUB_STEP_SUMMARY
+          echo "--- llama-server log (last 30 lines) ---" >> $GITHUB_STEP_SUMMARY
+          tail -30 llama-server.log >> $GITHUB_STEP_SUMMARY || true
+          echo '```' >> $GITHUB_STEP_SUMMARY

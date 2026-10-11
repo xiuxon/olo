@@ -1,0 +1,225 @@
+name: Diagnose Secure APK (emulator)
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: pc-share release tag (blank = latest)
+        required: false
+        default: ''
+      extra_asset:
+        description: optional extra release asset to install+launch after secure test (blank = skip)
+        required: false
+        default: ''
+permissions:
+  contents: read
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    env:
+      LOG_KEY: ${{ secrets.PCSHARE_LOG_KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [29, 30, 33]
+    steps:
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Download APKs
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ github.event.inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG=$(gh api repos/nilow9950/pc-share/releases/latest --jq .tag_name </dev/null); fi
+          echo "tag=$TAG"
+          mkdir -p apks
+          gh release download "$TAG" --repo nilow9950/pc-share --pattern 'PC-Share-secure.apk' --dir apks </dev/null
+          mv apks/PC-Share-secure.apk apks/secure.apk
+          gh release download "$TAG" --repo nilow9950/pc-share --pattern 'PC-Share.apk' --dir apks </dev/null
+          EXTRA="${{ github.event.inputs.extra_asset }}"
+          if [ -n "$EXTRA" ]; then
+            gh release download "$TAG" --repo nilow9950/pc-share --pattern "$EXTRA" --dir apks </dev/null || true
+          fi
+          ls -l apks
+          sha256sum apks/*.apk
+      - name: Install log decrypt helper
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          set -e
+          python3 -c "import cryptography" 2>/dev/null || { pip install --quiet cryptography || pip install --quiet --break-system-packages cryptography; }
+          python3 -c "import cryptography" >/dev/null 2>&1 && echo "cryptography OK" || { echo "cryptography MISSING"; exit 1; }
+          curl -fsSL -H "Authorization: token $GH_TOKEN" \
+            https://raw.githubusercontent.com/nilow9950/secure-app/main/tools/decrypt_log.py \
+            -o /tmp/sa_dec.py && echo "decrypt helper fetched" || { echo "decrypt helper fetch FAILED"; exit 1; }
+          cat > /tmp/gs.sh <<'EOF'
+          #!/bin/sh
+          # gs.sh <integ|crash|/path> <cmd...>
+          # Pull an app-private diag file, decrypt ELOG1 (plain passthrough),
+          # run cmd on the plaintext. Exit 1 if the file is missing/undecryptable.
+          case "$1" in
+            integ) R='/data/data/com.nextec.pcshare/files/sa_integ.txt' ;;
+            crash) R='/data/data/com.nextec.pcshare/cache/Crash Reports/sa_crash.txt' ;;
+            *)     R="$1" ;;
+          esac
+          shift
+          rm -f /tmp/gs_raw /tmp/gs_txt
+          if ! adb pull "$R" /tmp/gs_raw >/dev/null 2>&1; then
+            echo "(missing: $R)"
+            exit 1
+          fi
+          if ! python3 /tmp/sa_dec.py /tmp/gs_raw > /tmp/gs_txt; then
+            echo "(decrypt failed: $R)"
+            exit 1
+          fi
+          exec "$@" /tmp/gs_txt
+          EOF
+          chmod +x /tmp/gs.sh
+          echo "LOG_KEY set: $([ -n "$LOG_KEY" ] && echo yes || echo NO)"
+          sh -n /tmp/gs.sh && echo "gs.sh syntax OK"
+      - name: Install + launch + capture
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          arch: x86_64
+          target: default
+          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          disable-animations: true
+          script: |
+            set -x
+            adb wait-for-device
+            adb shell getprop ro.build.version.sdk
+            adb shell 'rm -rf /sdcard/PCShare /sdcard/Download/PCShareDiag' || true
+            adb shell input keyevent 82 || true
+            echo "======== CONTROL: PLAIN APK ========"
+            adb install -r apks/PC-Share.apk || true
+            adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true
+            sleep 10
+            adb shell pidof com.nextec.pcshare && echo "PLAIN_OK" || echo "PLAIN_DEAD"
+            adb logcat -d -s AndroidRuntime:E > plain_crash.txt || true
+            echo "--- plain crash:"; cat plain_crash.txt || true
+            adb shell uiautomator dump /sdcard/plain_ui.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/plain_ui.xml plain_ui.xml >/dev/null 2>&1 || true
+            grep -q "Connection guide" plain_ui.xml && echo "GUIDE_PLAIN_OK" || echo "GUIDE_PLAIN_MISSING"
+            grep -q "Got it" plain_ui.xml && echo "GUIDE_PLAIN_BTN_OK" || echo "GUIDE_PLAIN_BTN_MISSING"
+            echo "======== PLAIN SECOND OPEN ========"
+            adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 10; adb shell pidof com.nextec.pcshare && echo "SECOND_PLAIN_OK" || echo "SECOND_PLAIN_DEAD"; adb logcat -d -s AndroidRuntime:E | tail -n 30 || true
+            adb uninstall com.nextec.pcshare || true
+            sleep 2
+            echo "======== TEST: SECURE APK ========"
+            sha256sum apks/secure.apk
+            adb install -r apks/secure.apk
+            sleep 2
+            adb logcat -c || true
+            adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true
+            sleep 14
+            adb shell pidof com.nextec.pcshare && echo "SECURE_OK" || echo "SECURE_DEAD"
+            adb shell uiautomator dump /sdcard/secure_ui.xml >/dev/null 2>&1 || true
+            adb pull /sdcard/secure_ui.xml secure_ui.xml >/dev/null 2>&1 || true
+            grep -q "Connection guide" secure_ui.xml && echo "GUIDE_SECURE_OK" || echo "GUIDE_SECURE_MISSING"
+            grep -q "Got it" secure_ui.xml && echo "GUIDE_SECURE_BTN_OK" || echo "GUIDE_SECURE_BTN_MISSING"
+            echo "======== SECURE SECOND OPEN ========"
+            adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo "SECOND_SECURE_OK" || echo "SECOND_SECURE_DEAD"; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; adb logcat -d | grep -E "FATAL|AssertionError|secureapp" | tail -n 40 || true; echo "== sa_integ after 2nd open =="; /tmp/gs.sh integ cat || true
+            echo "======== SECURE FORCED RECOMPILE -> THIRD OPEN ========"
+            adb shell cmd package compile -m speed -f com.nextec.pcshare || true; sleep 3; adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; PIDT=$(adb shell pidof com.nextec.pcshare | tr -d "\r" || true); echo "pidof_raw=[$PIDT]"; adb logcat -d -s AndroidRuntime:E | grep -q AssertionError && echo "THIRD_RECOMPILE_DIED (should NOT happen with dex_fingerprint)" || echo "THIRD_RECOMPILE_ALIVE (dexfp: legit recompile re-baselined)"; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; /tmp/gs.sh integ grep -E "rebase\(dex=|dexfp apk=" || true; /tmp/gs.sh integ grep -qF "rebase(dex=" && echo "THIRD_DEXFP_OK (rebase(dex=ok/unp) seen)" || echo "THIRD_DEXFP_MISSING"; echo "== sa_integ after recompile open =="; /tmp/gs.sh integ cat || true
+            echo "======== secure prefs (guide flag should be ABSENT on fresh data) ========"
+            adb root >/dev/null 2>&1 || true
+            sleep 2
+            adb shell 'ls /data/data/com.nextec.pcshare/shared_prefs/ 2>/dev/null; cat /data/data/com.nextec.pcshare/shared_prefs/*.xml 2>/dev/null | grep -i "guide\|shown"' || true
+            echo "======== secure crash (AndroidRuntime:E) ========"
+            adb logcat -d -s AndroidRuntime:E > secure_crash.txt || true
+            cat secure_crash.txt || true
+            echo "======== secure FATAL/grep ========"
+            adb logcat -d | grep -E "FATAL|secureapp|AssertionError|NoClassDefFound|VerifyError|NoSuchMethod" | tail -n 120 || true
+            echo "======== our crash file (if any, app-private cache) ========"
+            adb root >/dev/null 2>&1 || true
+            sleep 2
+            /tmp/gs.sh crash cat || true
+            echo "======== ART/dexopt diagnostics ========"
+            adb logcat -d | grep -iE "dex2oat|installd|dexopt|vdex|checksum|corrupt|not a valid dex" | tail -n 80 || true
+            adb shell 'dumpsys package com.nextec.pcshare | grep -iA3 dexopt' || true
+            adb root >/dev/null 2>&1 || true
+            sleep 2
+            adb shell 'ls -la /data/data/com.nextec.pcshare/ 2>/dev/null; cat /data/data/com.nextec.pcshare/shared_prefs/sa_integ.xml 2>/dev/null' || true
+            echo '== sa_integ.txt (filesDir) =='
+            /tmp/gs.sh integ cat || true
+            echo '== crash file (cache/Crash Reports) =='
+            adb shell 'ls -la "/data/data/com.nextec.pcshare/cache/Crash Reports/" 2>/dev/null' || true
+            /tmp/gs.sh crash cat || true
+            echo '== shared-storage must stay EMPTY (round-24 standard) =='
+            adb shell 'ls /sdcard/PCShare 2>/dev/null; ls /sdcard/Download/PCShareDiag 2>/dev/null' | grep -q . && echo "SHARED_STORAGE_LEAK_FOUND_BROKEN" || echo "NO_SHARED_STORAGE_OK"
+            adb shell 'ls -la /data/app/*/com.nextec.pcshare*/ 2>/dev/null; ls -la /data/app/*/com.nextec.pcshare*/oat/*/ 2>/dev/null' || true
+            echo "======== EXTRA ASSET TEST (if downloaded) ========"
+            EXTRA_APK=$(ls apks/*.apk | grep -vE 'PC-Share\.apk|secure\.apk' | head -n1 || true); if [ -n "$EXTRA_APK" ]; then echo "extra apk: $EXTRA_APK"; sha256sum "$EXTRA_APK"; adb uninstall com.nextec.pcshare || true; sleep 2; adb install -r "$EXTRA_APK"; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo "EXTRA_OK" || echo "EXTRA_DEAD"; adb shell uiautomator dump /sdcard/extra_ui.xml >/dev/null 2>&1 || true; adb pull /sdcard/extra_ui.xml extra_ui.xml >/dev/null 2>&1 || true; grep -q "Connection guide" extra_ui.xml && echo "GUIDE_EXTRA_OK" || echo "GUIDE_EXTRA_MISSING"; grep -q "UPDATE NOW" extra_ui.xml && echo "EXTRA_DIALOG_UNEXPECTED" || echo "EXTRA_NO_DIALOG_OK"; adb logcat -d -s AndroidRuntime:E | tail -n 40; adb logcat -d | grep -E "FATAL|secureapp|AssertionError|NoClassDefFound|VerifyError" | tail -n 40 || true; echo "======== EXTRA SECOND OPEN ========"; adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo "SECOND_EXTRA_OK" || echo "SECOND_EXTRA_DEAD"; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; echo "== sa_integ after EXTRA 2nd open =="; /tmp/gs.sh integ cat || true; else echo "EXTRA_SKIPPED"; fi
+            echo "======== FIX: RECOMPILE -> REOPEN (was DEAD) ========"; adb root >/dev/null 2>&1 || true; sleep 2; adb shell cmd package compile -m speed -f com.nextec.pcshare || true; sleep 3; adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; PIDF=$(adb shell pidof com.nextec.pcshare | tr -d "\r" || true); echo "pidof_raw=[$PIDF]"; adb logcat -d -s AndroidRuntime:E | grep -q AssertionError && echo "FIX_RECOMPILE_DIED (should NOT happen with dex_fingerprint)" || echo "FIX_RECOMPILE_ALIVE (dexfp: legit recompile re-baselined)"; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; /tmp/gs.sh integ grep -qF "rebase(dex=" && echo "FIX_DEXFP_OK" || echo "FIX_DEXFP_MISSING"; echo "== sa_integ after FIX recompile open =="; /tmp/gs.sh integ cat || true
+            echo "======== RESET BASELINE (pm clear) so later legs are testable ========"; adb shell pm clear com.nextec.pcshare || true; sleep 3; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo "REBASE_RESET_OK" || echo "REBASE_RESET_DEAD"; /tmp/gs.sh integ cat || true; echo "======== GRANT ALL -> REOPEN (user crash repro) ========"; adb shell pm grant com.nextec.pcshare android.permission.READ_EXTERNAL_STORAGE || true; adb shell pm grant com.nextec.pcshare android.permission.WRITE_EXTERNAL_STORAGE || true; adb shell pm grant com.nextec.pcshare android.permission.ACCESS_FINE_LOCATION || true; adb shell pm grant com.nextec.pcshare android.permission.POST_NOTIFICATIONS || true; adb shell appops set com.nextec.pcshare MANAGE_EXTERNAL_STORAGE allow || true; sleep 45; adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo "GRANT_REOPEN_OK" || echo "GRANT_REOPEN_DEAD"; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; echo "== sa_integ after grant reopen =="; /tmp/gs.sh integ cat || true
+            echo "======== REVOKE STORAGE -> REOPEN (LP feature must DIE) ========"; adb shell pm revoke com.nextec.pcshare android.permission.READ_EXTERNAL_STORAGE || true; adb shell pm revoke com.nextec.pcshare android.permission.WRITE_EXTERNAL_STORAGE || true; adb shell appops set com.nextec.pcshare MANAGE_EXTERNAL_STORAGE deny || true; adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb shell pidof com.nextec.pcshare && echo "REVOKE_REOPEN_ALIVE_OK" || echo "REVOKE_REOPEN_DIED"; P=$(adb shell pidof com.nextec.pcshare | tr -d '\r' || true); echo "pidof_raw=[$P]"; if [ -n "$P" ]; then FP=$(echo "$P" | cut -d' ' -f1); adb shell "cut -d' ' -f1-6 /proc/$FP/stat 2>/dev/null; grep -E '^(State|PPid)' /proc/$FP/status 2>/dev/null" || true; fi; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; echo "== sa_integ after revoke reopen =="; /tmp/gs.sh integ cat || true; /tmp/gs.sh integ grep -q "perm recover" && echo "PERM_RECOVER_OK" || echo "PERM_RECOVER_MISSING"
+            echo "======== TAMPER (LP-style): edit dex inside base.vdex -> must DIE (dex=DIFF) ========"; adb root >/dev/null 2>&1 || true; sleep 3; VDEX=$(adb shell 'find /data/app -name base.vdex -path "*nextec*" 2>/dev/null | head -1' | tr -d "\r"); echo "vdex=[$VDEX]"; if [ -z "$VDEX" ]; then adb shell 'ls -la /data/app/*/com.nextec.pcshare*/oat/*/ 2>/dev/null' || true; fi; if [ -z "$VDEX" ]; then echo "TAMPER_SKIPPED (no base.vdex)"; else STAT=$(adb shell "stat -c '%u:%g' $VDEX" | tr -d "\r"); MODE=$(adb shell "stat -c '%a' $VDEX" | tr -d "\r"); echo "orig owner=$STAT mode=$MODE"; adb pull "$VDEX" /tmp/base.vdex >/dev/null 2>&1; ls -l /tmp/base.vdex || true; cp /tmp/base.vdex /tmp/base_vdex_orig.bin || true; python3 -c 'import re;d=bytearray(open("/tmp/base.vdex","rb").read());hits=[m.start() for m in re.finditer(b"onCreate",bytes(d))] or [m.start() for m in re.finditer(b"androidx",bytes(d))];print("patch_hits",len(hits));[d.__setitem__(h+2,d[h+2]^0x20) for h in hits];open("/tmp/base.vdex","wb").write(bytes(d))' ; echo "patch_rc=$?"; adb push /tmp/base.vdex "$VDEX" >/dev/null 2>&1; adb shell "chown $STAT $VDEX; chmod $MODE $VDEX; restorecon $VDEX" || true; adb shell am force-stop com.nextec.pcshare; sleep 2; adb logcat -c || true; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 14; adb logcat -d -s AndroidRuntime:E | grep -q AssertionError && echo "TAMPER_DIED_OK (dex=DIFF fired)" || echo "TAMPER_ALIVE_BROKEN (fingerprint did not fire)"; adb logcat -d -s AndroidRuntime:E | tail -n 40 || true; /tmp/gs.sh integ grep -E "dex=DIFF|rebase\(dex=|dexfp apk=" || true; /tmp/gs.sh integ grep -qF "dex=DIFF" && echo "TAMPER_MARKER_OK" || echo "TAMPER_MARKER_MISSING"; echo "== sa_integ after TAMPER open =="; /tmp/gs.sh integ cat || true; fi
+
+      - name: vdex fpDex analysis (runner side)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+        run: |
+          ls -l /tmp/base_vdex_orig.bin /tmp/base.vdex 2>/dev/null || echo "no pulled vdex"
+          curl -fsSL -H "Authorization: token $GH_TOKEN" \
+            https://raw.githubusercontent.com/nilow9950/secure-app/main/tools/vdex_diag.py \
+            -o /tmp/vdex_diag.py && echo "analyzer fetched" || echo "analyzer fetch FAILED"
+          for f in /tmp/base_vdex_orig.bin /tmp/base.vdex; do
+            if [ -f "$f" ]; then
+              echo "===== $f ====="
+              python3 /tmp/vdex_diag.py "$f" apks/secure.apk || echo "analyzer rc=$?"
+            fi
+          done
+          if [ -f /tmp/base_vdex_orig.bin ]; then
+            python3 - <<'PY'
+          import struct
+          b = open("/tmp/base_vdex_orig.bin", "rb").read()
+          def ru32(o): return struct.unpack_from("<I", b, o)[0]
+          def hx(o, n=48):
+              c = b[o:o+n]
+              return c.hex() + " | " + "".join(chr(x) if 32 <= x < 127 else "." for x in c)
+          def uleb(o):
+              s = 0; sh = 0; i = o
+              while i < len(b):
+                  v = b[i]; i += 1; s |= (v & 127) << sh
+                  if not v & 128: break
+                  sh += 7
+              return s, i
+          print("PROBE vdex len", len(b), "head64", hx(0, 64))
+          imgs = []
+          for mg in (b"cdex001\x00", b"dex\n035\x00"):
+              i = 0
+              while True:
+                  j = b.find(mg, i)
+                  if j < 0: break
+                  imgs.append((mg[:4].decode("latin1"), j)); i = j + 1
+          for kind, base in sorted(imgs, key=lambda x: x[1]):
+              if base + 112 > len(b): continue
+              fsz = ru32(base + 32); hs = ru32(base + 36)
+              if hs not in (0x70, 0x88) or fsz < 0x70 or base + fsz > len(b):
+                  print("PROBE", kind, "@", base, "skip hs=%#x fsz=%d" % (hs, fsz)); continue
+              strN = ru32(base + 56); strOff = ru32(base + 60)
+              dataSz = ru32(base + 104); dataOff = ru32(base + 108); mapOff = ru32(base + 52)
+              print("PROBE %s @%d fsz=%d hs=%#x strN=%d strOff=%d dataSz=%d dataOff=%d mapOff=%d" % (kind, base, fsz, hs, strN, strOff, dataSz, dataOff, mapOff))
+              if kind == "cdex" and strN > 0 and strOff + 4 <= fsz:
+                  str0 = ru32(base + strOff)
+                  print("PROBE  str0=%d ext=%s" % (str0, [hex(ru32(base + o)) for o in range(112, 136, 4)]))
+                  for nm, abs_ in (("filerel", base + str0), ("datarel", base + dataOff + str0), ("vdexabs", str0)):
+                      if 0 <= abs_ < len(b) - 4:
+                          try:
+                              ln, pos = uleb(abs_)
+                              print("PROBE   %s abs=%d uleb=%d %s" % (nm, abs_, ln, hx(abs_)))
+                          except Exception as e:
+                              print("PROBE   %s abs=%d err=%s" % (nm, abs_, e))
+                      else:
+                          print("PROBE   %s abs=%d OOB len=%d" % (nm, abs_, len(b)))
+          PY
+            TAGU="${{ github.event.inputs.tag }}"
+            if [ -z "$TAGU" ]; then TAGU=$(gh api repos/nilow9950/pc-share/releases/latest --jq .tag_name </dev/null); fi
+            cp /tmp/base_vdex_orig.bin "/tmp/probe-vdex-api${{ matrix.api-level }}.bin" || echo "cp FAILED rc=$?"
+            gh release upload "$TAGU" "/tmp/probe-vdex-api${{ matrix.api-level }}.bin" --repo nilow9950/pc-share --clobber </dev/null && echo "vdex uploaded api${{ matrix.api-level }}" || echo "vdex upload FAILED rc=$?"
+          fi
