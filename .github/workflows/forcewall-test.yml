@@ -1,20 +1,40 @@
 name: Forcewall Test (emulator, hard-force E2E)
+
+# Generic hard-force wall test (API 30): install the secure APK built from a
+# forcewall-style config -> assert the update wall shows, UPDATE NOW button
+# present, BACK cannot dismiss it, tapping UPDATE NOW does NOT dismiss it.
+#
+# Inputs:
+#   repo   - app repo holding the release (owner/name)
+#   package- app package name
+#   tag    - release tag (blank = latest)
+#   asset  - release asset built from the forcewall config (blank = auto-detect)
+
 on:
   workflow_dispatch:
     inputs:
+      repo:
+        description: 'app repo holding the release (owner/name)'
+        required: true
+      package:
+        description: 'app package name'
+        required: true
       tag:
-        description: pc-share release tag (blank = latest)
+        description: 'release tag (blank = latest)'
         required: false
         default: ''
       asset:
-        description: release asset built from pcshare-forcewall config
+        description: 'forcewall APK asset (blank = auto-detect *forcewall*/*test* apk)'
         required: false
-        default: 'forcewall-test.apk'
+        default: ''
 permissions:
   contents: read
 jobs:
   forcewall:
     runs-on: ubuntu-latest
+    env:
+      APP_REPO: ${{ inputs.repo }}
+      GH_TOKEN: ${{ startsWith(inputs.repo, 'xiuxon/') && secrets.REPO_TOKEN || secrets.EXT_REPO_TOKEN }}
     steps:
       - name: Enable KVM
         run: |
@@ -22,15 +42,23 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
       - name: Download APK
-        env:
-          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
         run: |
           set -e
-          TAG="${{ github.event.inputs.tag }}"
-          if [ -z "$TAG" ]; then TAG=$(gh api repos/nilow9950/pc-share/releases/latest --jq .tag_name </dev/null); fi
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG=$(gh api "repos/$APP_REPO/releases/latest" --jq .tag_name </dev/null); fi
           echo "tag=$TAG"
           mkdir -p apks
-          gh release download "$TAG" --repo nilow9950/pc-share --pattern "${{ github.event.inputs.asset }}" --dir apks </dev/null
+          gh api --paginate "repos/$APP_REPO/releases/tags/$TAG" --jq '.assets[].name' > /tmp/assets.txt
+          ASSET="${{ inputs.asset }}"
+          if [ -z "$ASSET" ]; then ASSET=$(grep -Ei 'forcewall.*\.apk$|test.*\.apk$' /tmp/assets.txt | head -1); fi
+          if [ -z "$ASSET" ]; then
+            echo "could not resolve forcewall apk; candidates were:"
+            cat /tmp/assets.txt
+            exit 1
+          fi
+          echo "asset=$ASSET"
+          gh release download "$TAG" --repo "$APP_REPO" --pattern "$ASSET" --dir apks </dev/null
+          mv "apks/$ASSET" apks/wall.apk
           ls -l apks
           sha256sum apks/*
       - name: Install + wall assertions
@@ -46,14 +74,14 @@ jobs:
             adb wait-for-device
             adb shell getprop ro.build.version.sdk
             adb shell input keyevent 82 || true
-            adb uninstall com.nextec.pcshare || true
+            adb uninstall ${{ inputs.package }} || true
             sleep 2
-            adb install -r "apks/${{ github.event.inputs.asset }}" || true
+            adb install -r "apks/wall.apk" || true
             sleep 2
             adb logcat -c || true
-            adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true
+            adb shell monkey -p ${{ inputs.package }} -c android.intent.category.LAUNCHER 1 || true
             sleep 15
-            adb shell pidof com.nextec.pcshare && echo FORCEWALL_APP_ALIVE || echo FORCEWALL_APP_DEAD
+            adb shell pidof ${{ inputs.package }} && echo FORCEWALL_APP_ALIVE || echo FORCEWALL_APP_DEAD
             adb shell uiautomator dump /sdcard/fw1.xml >/dev/null 2>&1 || true
             adb pull /sdcard/fw1.xml fw1.xml >/dev/null 2>&1 || true
             grep -q "HARD WALL TEST" fw1.xml && echo FORCEWALL_SHOWN_OK || echo FORCEWALL_SHOWN_MISSING
@@ -64,7 +92,7 @@ jobs:
             adb shell uiautomator dump /sdcard/fw2.xml >/dev/null 2>&1 || true
             adb pull /sdcard/fw2.xml fw2.xml >/dev/null 2>&1 || true
             grep -q "HARD WALL TEST" fw2.xml && echo FORCEWALL_BACK_BLOCKED_OK || echo FORCEWALL_BACK_CLOSED_FAIL
-            adb shell pidof com.nextec.pcshare && echo FORCEWALL_ALIVE2 || echo FORCEWALL_DEAD2
+            adb shell pidof ${{ inputs.package }} && echo FORCEWALL_ALIVE2 || echo FORCEWALL_DEAD2
             B=$(grep -o 'text="UPDATE NOW"[^>]*bounds="\[[0-9]*,[0-9]*\]\[[0-9]*,[0-9]*\]"' fw1.xml || true); if [ -n "$B" ]; then set -- $(echo "$B" | grep -o '[0-9]\+'); adb shell input tap $(( ($1+$3)/2 )) $(( ($2+$4)/2 )); echo FORCEWALL_TAP_SENT; else echo FORCEWALL_TAP_PARSE_FAIL; fi
             sleep 5
             adb shell input keyevent KEYCODE_BACK || true
@@ -75,8 +103,8 @@ jobs:
             adb pull /sdcard/fw3.xml fw3.xml >/dev/null 2>&1 || true
             grep -q "HARD WALL TEST" fw3.xml && echo FORCEWALL_SURVIVES_TAP_OK || echo FORCEWALL_DISMISSED_FAIL
             grep -q "UPDATE NOW" fw3.xml && echo FORCEWALL_BTN_ALIVE_OK || echo FORCEWALL_BTN_GONE
-            adb shell pidof com.nextec.pcshare && echo FORCEWALL_ALIVE3 || echo FORCEWALL_DEAD3
+            adb shell pidof ${{ inputs.package }} && echo FORCEWALL_ALIVE3 || echo FORCEWALL_DEAD3
             adb logcat -d | grep -E "FATAL|secureapp|AssertionError|NoClassDefFound|VerifyError" | tail -n 40 || true
             echo "== sa_integ =="
-            adb shell 'cat /data/data/com.nextec.pcshare/files/sa_integ.txt 2>/dev/null | head -n 25' || true
+            adb shell "cat /data/data/${{ inputs.package }}/files/sa_integ.txt 2>/dev/null | head -n 25" || true
             echo FORCEWALL_TEST_DONE

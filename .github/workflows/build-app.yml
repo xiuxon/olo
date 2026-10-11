@@ -1,10 +1,25 @@
-name: Build PC Share (via Kosua)
+name: Build App (APK + AAB)
+
+# Generic app build: gradle assembleRelease + bundleRelease for ANY app repo,
+# signed with the shared keystore, published as a new release on the app repo.
+#
+# Inputs:
+#   repo - app source repo (owner/name)
+#   name - asset name prefix (e.g. MyApp -> MyApp.apk / MyApp.aab
+#          / MyApp.aab.mapping.txt)
+#
+# Token rules: xiuxon/* repos use secrets.REPO_TOKEN, any other owner uses
+# secrets.EXT_REPO_TOKEN (falls back to REPO_TOKEN when unset).
 
 on:
   workflow_dispatch:
-
-env:
-  PCSHARE_REPO: nilow9950/pc-share
+    inputs:
+      repo:
+        description: 'app source repo (owner/name)'
+        required: true
+      name:
+        description: 'release asset name prefix (e.g. MyApp)'
+        required: true
 
 permissions:
   contents: read
@@ -13,12 +28,16 @@ permissions:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
+    env:
+      APP_REPO: ${{ inputs.repo }}
+      APP_NAME: ${{ inputs.name }}
+      GH_TOKEN: ${{ startsWith(inputs.repo, 'xiuxon/') && secrets.REPO_TOKEN || secrets.EXT_REPO_TOKEN }}
     steps:
-      - name: Checkout private PC Share source
+      - name: Checkout app source
         uses: actions/checkout@v4
         with:
-          repository: nilow9950/pc-share
-          token: ${{ secrets.XBOX_REPO_TOKEN }}
+          repository: ${{ inputs.repo }}
+          token: ${{ env.GH_TOKEN }}
           persist-credentials: false
 
       - name: Set up JDK 17
@@ -33,46 +52,45 @@ jobs:
           gradle-version: '8.7'
 
       - name: Restore keystore
-        run: echo "${XBOX_KEYSTORE_B64}" | base64 -d > keystore.jks
+        run: echo "${KEYSTORE_B64}" | base64 -d > keystore.jks
         env:
-          XBOX_KEYSTORE_B64: ${{ secrets.XBOX_KEYSTORE_B64 }}
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
 
       - name: Build APK + AAB
         env:
           KEYSTORE: ${{ github.workspace }}/keystore.jks
-          STORE_PASS: ${{ secrets.XBOX_STORE_PASS }}
-          KEY_ALIAS: ${{ secrets.XBOX_KEY_ALIAS }}
+          STORE_PASS: ${{ secrets.STORE_PASS }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
         run: gradle assembleRelease bundleRelease
 
-      - name: Publish release to PC Share
-        env:
-          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
+      - name: Publish release to app repo
         run: |
+          set -e
           mkdir -p dist
           APK=$(find app/build/outputs/apk -name "*.apk" -type f | grep -v unsigned | head -1)
           AAB=$(find app/build/outputs/bundle -name "*.aab" -type f | head -1)
           echo "APK=$APK AAB=$AAB"
           [ -n "$APK" ] && [ -n "$AAB" ] || { echo "missing build output"; exit 1; }
-          cp "$APK" dist/PC-Share.apk
-          cp "$AAB" dist/PC-Share.aab
+          cp "$APK" "dist/$APP_NAME.apk"
+          cp "$AAB" "dist/$APP_NAME.aab"
           MP=$(find app/build/outputs/mapping -name "mapping.txt" -type f | head -1)
           if [ -n "$MP" ]; then
-            cp "$MP" dist/PC-Share.aab.mapping.txt
-            echo "AGP mapping: $(wc -l < dist/PC-Share.aab.mapping.txt) lines"
+            cp "$MP" "dist/$APP_NAME.aab.mapping.txt"
+            echo "AGP mapping: $(wc -l < "dist/$APP_NAME.aab.mapping.txt") lines"
           else
             echo "WARN: AGP mapping.txt not found"
           fi
-          file dist/PC-Share.apk
+          file "dist/$APP_NAME.apk"
           ls -l dist
           TAG="apk-$(date +%Y%m%d-%H%M%S)"
-          ASSETS=(dist/PC-Share.apk dist/PC-Share.aab)
-          [ -f dist/PC-Share.aab.mapping.txt ] && ASSETS+=(dist/PC-Share.aab.mapping.txt)
+          ASSETS=("dist/$APP_NAME.apk" "dist/$APP_NAME.aab")
+          [ -f "dist/$APP_NAME.aab.mapping.txt" ] && ASSETS+=("dist/$APP_NAME.aab.mapping.txt")
           gh release create "$TAG" "${ASSETS[@]}" \
-            --repo "$PCSHARE_REPO" --title "PC Share $TAG" \
-            --notes "APK + AAB built on public Kosua runner; assets stay on private pc-share." \
+            --repo "$APP_REPO" --title "$APP_NAME $TAG" \
+            --notes "APK + AAB built on public runner; assets stay on the app repo." \
             --generate-notes
 
-  purge-kosua-logs:
+  purge-logs:
     runs-on: ubuntu-latest
     needs: [build-apk]
     if: ${{ needs.build-apk.result == 'success' }}
@@ -80,7 +98,7 @@ jobs:
       actions: write
       contents: read
     steps:
-      - name: Delete all Kosua workflow runs (logs)
+      - name: Delete all workflow runs (logs)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

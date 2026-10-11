@@ -1,9 +1,54 @@
-name: Perm test (location ask on fresh install)
+name: Permission test (fresh install)
+
+# Generic permission-flow test (API 30/33): fresh install -> guide dismiss ->
+# storage dialog on 1st START -> appops grant -> relaunch -> location and
+# notification dialogs -> deny rounds -> latch re-ask check -> settings
+# fallback check.
+#
+# Inputs:
+#   repo         - app repo holding the release (owner/name)
+#   package      - app package name
+#   tag          - release tag (blank = latest)
+#   plain_asset  - plain APK asset (blank = auto-detect first non-secure/test apk)
+#   power_id     - power button view id name (e.g. powerBtn)
+#   guide_id     - onboarding done-button id name (e.g. tipsDone)
+#   guide_btn    - onboarding done-button text (optional, e.g. Got it)
+#   storage_text - storage permission dialog text (blank = skip check)
+#   blocked_text - location blocked dialog text (blank = skip check)
+
 on:
   workflow_dispatch:
     inputs:
+      repo:
+        description: 'app repo holding the release (owner/name)'
+        required: true
+      package:
+        description: 'app package name'
+        required: true
       tag:
-        description: pc-share release tag (blank = latest)
+        description: 'release tag (blank = latest)'
+        required: false
+        default: ''
+      plain_asset:
+        description: 'plain APK asset (blank = auto-detect)'
+        required: false
+        default: ''
+      power_id:
+        description: 'power button view id name (e.g. powerBtn)'
+        required: true
+      guide_id:
+        description: 'onboarding done-button id name (e.g. tipsDone)'
+        required: true
+      guide_btn:
+        description: 'onboarding done-button text (optional, e.g. Got it)'
+        required: false
+        default: ''
+      storage_text:
+        description: 'storage permission dialog text (blank = skip check)'
+        required: false
+        default: ''
+      blocked_text:
+        description: 'location blocked dialog text (blank = skip check)'
         required: false
         default: ''
 permissions:
@@ -11,6 +56,12 @@ permissions:
 jobs:
   permtest:
     runs-on: ubuntu-latest
+    env:
+      APP_REPO: ${{ inputs.repo }}
+      GH_TOKEN: ${{ startsWith(inputs.repo, 'xiuxon/') && secrets.REPO_TOKEN || secrets.EXT_REPO_TOKEN }}
+      STORAGE_TEXT: ${{ inputs.storage_text }}
+      BLOCKED_TEXT: ${{ inputs.blocked_text }}
+      GUIDE_BTN: ${{ inputs.guide_btn }}
     strategy:
       fail-fast: false
       matrix:
@@ -19,16 +70,26 @@ jobs:
       - name: Enable KVM
         run: echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules && sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
       - name: Download APK
-        env:
-          GH_TOKEN: ${{ secrets.XBOX_REPO_TOKEN }}
         run: |
           set -e
-          TAG="${{ github.event.inputs.tag }}"
-          if [ -z "$TAG" ]; then TAG=$(gh api repos/nilow9950/pc-share/releases/latest --jq .tag_name </dev/null); fi
+          TAG="${{ inputs.tag }}"
+          if [ -z "$TAG" ]; then TAG=$(gh api "repos/$APP_REPO/releases/latest" --jq .tag_name </dev/null); fi
           echo "tag=$TAG"
+          PLN="${{ inputs.plain_asset }}"
           mkdir -p apks
-          gh release download "$TAG" --repo nilow9950/pc-share --pattern 'PC-Share.apk' --dir apks </dev/null
-          sha256sum apks/*.apk
+          if [ -z "$PLN" ]; then
+            gh api --paginate "repos/$APP_REPO/releases/tags/$TAG" --jq '.assets[].name' > /tmp/assets.txt
+            PLN=$(grep -E '\.apk$' /tmp/assets.txt | grep -vEi 'extra|test|secure' | head -1)
+            if [ -z "$PLN" ]; then
+              echo "could not resolve plain apk; candidates were:"
+              cat /tmp/assets.txt
+              exit 1
+            fi
+          fi
+          echo "plain asset=$PLN"
+          gh release download "$TAG" --repo "$APP_REPO" --pattern "$PLN" --dir apks </dev/null
+          mv "apks/$PLN" apks/plain.apk
+          sha256sum apks/plain.apk
       - name: Fresh install then START then location dialog
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -40,30 +101,31 @@ jobs:
           script: |
             echo "=== api ${{ matrix.api-level }} ==="; adb wait-for-device; adb shell input keyevent 82 || true
             printf '%s\n' '#!/bin/sh' 'adb shell uiautomator dump /sdcard/u.xml >/dev/null 2>&1' 'adb shell cat /sdcard/u.xml > /tmp/u.xml 2>/dev/null' 'H=$(grep -o "<node[^>]*>" /tmp/u.xml | grep -E "$1" | head -1)' 'B=$(printf "%s" "$H" | grep -o "bounds=\"[^\"]*\"" | grep -o "[0-9-][0-9-]*")' 'set -- $B' 'X=$(( ($1+$3)/2 ))' 'Y=$(( ($2+$4)/2 ))' 'echo "TAP [$1,$2][$3,$4] -> $X,$Y"' 'adb shell input tap $X $Y' > /tmp/tap.sh; chmod +x /tmp/tap.sh; cat /tmp/tap.sh
-            adb uninstall com.nextec.pcshare || true; adb install apks/PC-Share.apk || true
-            adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 12; adb shell pidof com.nextec.pcshare && echo INSTALL_LAUNCH_OK || echo INSTALL_LAUNCH_DEAD
+            printf '%s\n' '#!/bin/sh' 'F="$1"; L="$2"; T="$3"' '[ -z "$T" ] && { echo "${L}_SKIPPED"; exit 0; }' 'if grep -qi -- "$T" "$F"; then echo "${L}_OK"; else echo "${L}_MISSING"; fi' > /tmp/grep.sh; chmod +x /tmp/grep.sh; cat /tmp/grep.sh
+            adb uninstall ${{ inputs.package }} || true; adb install apks/plain.apk || true
+            adb shell monkey -p ${{ inputs.package }} -c android.intent.category.LAUNCHER 1 || true; sleep 12; adb shell pidof ${{ inputs.package }} && echo INSTALL_LAUNCH_OK || echo INSTALL_LAUNCH_DEAD
             adb shell uiautomator dump /sdcard/s0.xml >/dev/null 2>&1; adb shell cat /sdcard/s0.xml > /tmp/s0.xml; echo "--- first screen:"; grep -o 'text="[^"]*"' /tmp/s0.xml | head -25
-            /tmp/tap.sh 'text="Got it"|text="GOT IT"|resource-id="com.nextec.pcshare:id/tipsDone"'; sleep 3
+            GU=$(printf '%s' "$GUIDE_BTN" | tr '[:lower:]' '[:upper:]'); GP="resource-id=\"${{ inputs.package }}:id/${{ inputs.guide_id }}\""; [ -n "$GUIDE_BTN" ] && GP="text=\"$GUIDE_BTN\"|text=\"$GU\"|$GP"; /tmp/tap.sh "$GP"; sleep 3
             adb shell uiautomator dump /sdcard/s0b.xml >/dev/null 2>&1; adb shell cat /sdcard/s0b.xml > /tmp/s0b.xml; echo "--- after guide dismiss:"; grep -o 'text="[^"]*"' /tmp/s0b.xml | head -25
             for i in 1 2 3 4 5; do adb shell uiautomator dump /sdcard/p.xml >/dev/null 2>&1; adb shell cat /sdcard/p.xml > /tmp/p.xml; if grep -qi "location" /tmp/p.xml; then echo "LOC_AT_OPEN_OK"; break; elif grep -qi "notification" /tmp/p.xml; then echo "NOTIF_AT_OPEN_FIRST"; /tmp/tap.sh 'text="DENY"|text="DON.T ALLOW"' >/dev/null; sleep 2; else sleep 2; fi; done; if grep -qi "location" /tmp/p.xml; then echo "--- first-open location dialog:"; grep -o 'text="[^"]*"' /tmp/p.xml | head -20; /tmp/tap.sh 'text="DENY"|text="DON.T ALLOW"' >/dev/null; sleep 2; else echo "LOC_AT_OPEN_MISSING"; fi
-            /tmp/tap.sh 'resource-id="com.nextec.pcshare:id/powerBtn"'; sleep 3
+            /tmp/tap.sh 'resource-id="${{ inputs.package }}:id/${{ inputs.power_id }}"'; sleep 3
             adb shell uiautomator dump /sdcard/s1.xml >/dev/null 2>&1; adb shell cat /sdcard/s1.xml > /tmp/s1.xml; echo "--- after 1st START:"; grep -o 'text="[^"]*"' /tmp/s1.xml | head -25
-            grep -qi "Storage access needed" /tmp/s1.xml && echo "STORAGE_DIALOG_OK" || echo "STORAGE_DIALOG_MISSING"
-            adb shell appops set com.nextec.pcshare MANAGE_EXTERNAL_STORAGE allow || true; echo "manager=$(adb shell appops get com.nextec.pcshare MANAGE_EXTERNAL_STORAGE 2>/dev/null)"
-            adb shell am force-stop com.nextec.pcshare; sleep 2; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 10; adb shell pidof com.nextec.pcshare && echo RELAUNCH_OK || echo RELAUNCH_DEAD
-            /tmp/tap.sh 'resource-id="com.nextec.pcshare:id/powerBtn"'; sleep 3
+            /tmp/grep.sh /tmp/s1.xml STORAGE_DIALOG "$STORAGE_TEXT"
+            adb shell appops set ${{ inputs.package }} MANAGE_EXTERNAL_STORAGE allow || true; echo "manager=$(adb shell appops get ${{ inputs.package }} MANAGE_EXTERNAL_STORAGE 2>/dev/null)"
+            adb shell am force-stop ${{ inputs.package }}; sleep 2; adb shell monkey -p ${{ inputs.package }} -c android.intent.category.LAUNCHER 1 || true; sleep 10; adb shell pidof ${{ inputs.package }} && echo RELAUNCH_OK || echo RELAUNCH_DEAD
+            /tmp/tap.sh 'resource-id="${{ inputs.package }}:id/${{ inputs.power_id }}"'; sleep 3
             adb shell uiautomator dump /sdcard/s2.xml >/dev/null 2>&1; adb shell cat /sdcard/s2.xml > /tmp/s2.xml; echo "--- after 2nd START:"; grep -o 'text="[^"]*"' /tmp/s2.xml | head -30
             grep -qi "location" /tmp/s2.xml && echo "LOC_DIALOG_OK" || echo "LOC_DIALOG_MISSING"
             grep -qi "notification" /tmp/s2.xml && echo "NOTIF_DIALOG_PRESENT" || echo "NOTIF_DIALOG_ABSENT"
-             grep -qi "notification" /tmp/s2.xml && { /tmp/tap.sh 'text="Allow"|text="ALLOW"' >/dev/null; sleep 3; } || true
-             for i in 1 2 3 4 5 6; do adb shell uiautomator dump /sdcard/q.xml >/dev/null 2>&1; adb shell cat /sdcard/q.xml > /tmp/q.xml; if grep -qiE "location\?|WHILE USING THE APP|ONLY THIS TIME|send notifications|Allow PC Share" /tmp/q.xml; then echo "ANSWER_ROUND_$i"; grep -o 'text="[^"]*"' /tmp/q.xml | head -12; /tmp/tap.sh 'text="DENY"|text="DON.T ALLOW"|text="No, thanks"|text="Block"' >/dev/null; sleep 3; else echo "DIALOG_CLEAR_$i"; break; fi; done
-             echo "--- after START permission rounds:"; grep -o 'text="[^"]*"' /tmp/q.xml | head -20
-             grep -qiE "location\?|WHILE USING THE APP" /tmp/q.xml && echo "LOC_STILL_UP" || echo "LOC_ANSWERED"
-             echo "--- latch check (ask once only) ---"; adb shell am force-stop com.nextec.pcshare; sleep 2; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 10; /tmp/tap.sh 'resource-id="com.nextec.pcshare:id/powerBtn"'; sleep 4; adb shell uiautomator dump /sdcard/s5.xml >/dev/null 2>&1; adb shell cat /sdcard/s5.xml > /tmp/s5.xml; grep -o 'text="[^"]*"' /tmp/s5.xml | head -20; grep -qiE "location\?|WHILE USING THE APP" /tmp/s5.xml && echo "LATCH_BROKEN_STILL_ASKING" || echo "LATCH_OK_NO_REASK"
-             adb shell am force-stop com.nextec.pcshare; sleep 2; adb shell monkey -p com.nextec.pcshare -c android.intent.category.LAUNCHER 1 || true; sleep 12
-             for i in 1 2 3 4; do adb shell uiautomator dump /sdcard/s4.xml >/dev/null 2>&1; adb shell cat /sdcard/s4.xml > /tmp/s4.xml; if grep -qi "Location access blocked" /tmp/s4.xml; then echo "SETTINGS_FALLBACK_OK"; break; elif grep -qiE "location\?|WHILE USING THE APP" /tmp/s4.xml; then echo "SYSTEM_STILL_ASKING_$i"; sleep 3; else echo "NO_DIALOG_$i"; sleep 3; fi; done
-             echo "--- after blocked-permission relaunch:"; grep -o 'text="[^"]*"' /tmp/s4.xml | head -25
-             grep -qi "Location access blocked" /tmp/s4.xml || echo "SETTINGS_FALLBACK_MISSING"
-             echo "--- location perm state:"; adb shell dumpsys package com.nextec.pcshare | grep -A1 -i "ACCESS_FINE_LOCATION" | head -6 || true
-             echo "--- crash:"; adb logcat -d -s AndroidRuntime:E | tail -10 || true
-             echo "PERMTEST_DONE"
+            grep -qi "notification" /tmp/s2.xml && { /tmp/tap.sh 'text="Allow"|text="ALLOW"' >/dev/null; sleep 3; } || true
+            for i in 1 2 3 4 5 6; do adb shell uiautomator dump /sdcard/q.xml >/dev/null 2>&1; adb shell cat /sdcard/q.xml > /tmp/q.xml; if grep -qiE "location\?|WHILE USING THE APP|ONLY THIS TIME|send notifications" /tmp/q.xml; then echo "ANSWER_ROUND_$i"; grep -o 'text="[^"]*"' /tmp/q.xml | head -12; /tmp/tap.sh 'text="DENY"|text="DON.T ALLOW"|text="No, thanks"|text="Block"' >/dev/null; sleep 3; else echo "DIALOG_CLEAR_$i"; break; fi; done
+            echo "--- after START permission rounds:"; grep -o 'text="[^"]*"' /tmp/q.xml | head -20
+            grep -qiE "location\?|WHILE USING THE APP" /tmp/q.xml && echo "LOC_STILL_UP" || echo "LOC_ANSWERED"
+            echo "--- latch check (ask once only) ---"; adb shell am force-stop ${{ inputs.package }}; sleep 2; adb shell monkey -p ${{ inputs.package }} -c android.intent.category.LAUNCHER 1 || true; sleep 10; /tmp/tap.sh 'resource-id="${{ inputs.package }}:id/${{ inputs.power_id }}"'; sleep 4; adb shell uiautomator dump /sdcard/s5.xml >/dev/null 2>&1; adb shell cat /sdcard/s5.xml > /tmp/s5.xml; grep -o 'text="[^"]*"' /tmp/s5.xml | head -20; grep -qiE "location\?|WHILE USING THE APP" /tmp/s5.xml && echo "LATCH_BROKEN_STILL_ASKING" || echo "LATCH_OK_NO_REASK"
+            adb shell am force-stop ${{ inputs.package }}; sleep 2; adb shell monkey -p ${{ inputs.package }} -c android.intent.category.LAUNCHER 1 || true; sleep 12
+            for i in 1 2 3 4; do adb shell uiautomator dump /sdcard/s4.xml >/dev/null 2>&1; adb shell cat /sdcard/s4.xml > /tmp/s4.xml; if [ -n "$BLOCKED_TEXT" ] && grep -qi -- "$BLOCKED_TEXT" /tmp/s4.xml; then echo "SETTINGS_FALLBACK_OK"; break; elif grep -qiE "location\?|WHILE USING THE APP" /tmp/s4.xml; then echo "SYSTEM_STILL_ASKING_$i"; sleep 3; else echo "NO_DIALOG_$i"; sleep 3; fi; done
+            echo "--- after blocked-permission relaunch:"; grep -o 'text="[^"]*"' /tmp/s4.xml | head -25
+            [ -z "$BLOCKED_TEXT" ] && echo "SETTINGS_FALLBACK_SKIPPED" || { grep -qi -- "$BLOCKED_TEXT" /tmp/s4.xml || echo "SETTINGS_FALLBACK_MISSING"; }
+            echo "--- location perm state:"; adb shell dumpsys package ${{ inputs.package }} | grep -A1 -i "ACCESS_FINE_LOCATION" | head -6 || true
+            echo "--- crash:"; adb logcat -d -s AndroidRuntime:E | tail -10 || true
+            echo "PERMTEST_DONE"
