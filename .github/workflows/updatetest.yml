@@ -84,11 +84,13 @@ jobs:
           ls -l apks/*/*.apk
           sha256sum apks/*/*.apk
       - name: Install log decrypt helper
+        env:
+          REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
         run: |
           set -e
           python3 -c "import cryptography" 2>/dev/null || { pip install --quiet cryptography || pip install --quiet --break-system-packages cryptography; }
           python3 -c "import cryptography" >/dev/null 2>&1 && echo "cryptography OK" || { echo "cryptography MISSING"; exit 1; }
-          curl -fsSL -H "Authorization: token $GH_TOKEN" \
+          curl -fsSL -H "Authorization: token $REPO_TOKEN" \
             https://raw.githubusercontent.com/xiuxon/secure-app/main/tools/decrypt_log.py \
             -o /tmp/sa_dec.py && echo "decrypt helper fetched" || { echo "decrypt helper fetch FAILED"; exit 1; }
           cat > /tmp/gs.sh <<EOF
