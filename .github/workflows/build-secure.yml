@@ -139,19 +139,25 @@ jobs:
         run: |
           set -e
           CFG="config/${{ inputs.app }}.json"
-          COMMON="--config $CFG --apk /tmp/plain.apk --apktool /tmp/apktool.jar \
-            --r8 /tmp/r8.jar --dex2jar $DEX2JAR --android-jar $ANDROID_JAR \
-            --zipalign $ZIPALIGN --apksigner $APKSIGNER \
-            --keystore /tmp/keystore.jks --ks-pass $STORE_PASS --alias $KEY_ALIAS"
           # pass 1: sideload artifact (config default self_digest - baked
           # full-APK digest compare, strongest for direct installs)
-          python3 tools/harden.py $COMMON --out /tmp/secure.apk
           # pass 2: Play bundle (baseline self-digest - Play re-packs the
           # bundle so a baked digest can never match; the dex is transplanted
           # into the plain bundle + jarsigner, the pass's APK sibling is
           # discarded - only the sideload APK from pass 1 ships)
+          # (function instead of a $COMMON string: store pass / key alias
+          # contain spaces and must stay single argv entries)
+          run_harden() {
+            python3 tools/harden.py --config "$CFG" --apk /tmp/plain.apk \
+              --apktool /tmp/apktool.jar --r8 /tmp/r8.jar \
+              --dex2jar "$DEX2JAR" --android-jar "$ANDROID_JAR" \
+              --zipalign "$ZIPALIGN" --apksigner "$APKSIGNER" \
+              --keystore /tmp/keystore.jks --ks-pass "$STORE_PASS" \
+              --alias "$KEY_ALIAS" "$@"
+          }
+          run_harden --out /tmp/secure.apk
           if [ -f /tmp/plain.aab ]; then
-            python3 tools/harden.py $COMMON --out /tmp/secure_play_pass.apk \
+            run_harden --out /tmp/secure_play_pass.apk \
               --self-digest baseline --aab /tmp/plain.aab --out-aab /tmp/play.aab
           fi
 
