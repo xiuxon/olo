@@ -182,6 +182,7 @@ jobs:
           c = json.load(open('config/${{ inputs.app }}.json'))['output']
           print('OUT_REPO=%s' % c['repo'])
           print('OUT_ASSET=%s' % c['asset'])
+          print('OUT_AAB_ASSET=%s' % (c.get('aab_asset') or ''))
           ")"
           case "$OUT_REPO" in xiuxon/*) GH_TOKEN="$REPO_TOKEN";; *) GH_TOKEN="${EXT_REPO_TOKEN:-$REPO_TOKEN}";; esac
           export GH_TOKEN
