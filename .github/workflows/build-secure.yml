@@ -118,7 +118,9 @@ jobs:
           import json
           c = json.load(open('config/${{ inputs.app }}.json'))
           print('IN_REPO=%s' % c['input']['repo'])
-          print('OUT_AAB=%s' % ('1' if c['output']['asset'].endswith('.aab') else '0'))
+          out = c['output']
+          want_aab = out['asset'].endswith('.aab') or (out.get('aab_asset') or '').endswith('.aab')
+          print('OUT_AAB=%s' % ('1' if want_aab else '0'))
           print('AAB_ASSET=%s' % c['input'].get('aab_asset', ''))
           ")"
           if [ "$OUT_AAB" != "1" ]; then echo "apk output - skip bundle fetch"; exit 0; fi
@@ -135,25 +137,31 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           LOG_KEY: ${{ secrets.LOG_KEY }}
         run: |
-          EXTRA=""
-          if [ -f /tmp/plain.aab ]; then EXTRA="--aab /tmp/plain.aab --out-aab /tmp/play.aab"; fi
-          python3 tools/harden.py --config "config/${{ inputs.app }}.json" \
-            --apk /tmp/plain.apk --out /tmp/secure.apk \
-            --apktool /tmp/apktool.jar --r8 /tmp/r8.jar --dex2jar "$DEX2JAR" \
-            --android-jar "$ANDROID_JAR" \
-            --zipalign "$ZIPALIGN" --apksigner "$APKSIGNER" \
-            --keystore /tmp/keystore.jks --ks-pass "$STORE_PASS" \
-            --alias "$KEY_ALIAS" $EXTRA
+          set -e
+          CFG="config/${{ inputs.app }}.json"
+          COMMON="--config $CFG --apk /tmp/plain.apk --apktool /tmp/apktool.jar \
+            --r8 /tmp/r8.jar --dex2jar $DEX2JAR --android-jar $ANDROID_JAR \
+            --zipalign $ZIPALIGN --apksigner $APKSIGNER \
+            --keystore /tmp/keystore.jks --ks-pass $STORE_PASS --alias $KEY_ALIAS"
+          # pass 1: sideload artifact (config default self_digest - baked
+          # full-APK digest compare, strongest for direct installs)
+          python3 tools/harden.py $COMMON --out /tmp/secure.apk
+          # pass 2: Play bundle (baseline self-digest - Play re-packs the
+          # bundle so a baked digest can never match; the dex is transplanted
+          # into the plain bundle + jarsigner, the pass's APK sibling is
+          # discarded - only the sideload APK from pass 1 ships)
+          if [ -f /tmp/plain.aab ]; then
+            python3 tools/harden.py $COMMON --out /tmp/secure_play_pass.apk \
+              --self-digest baseline --aab /tmp/plain.aab --out-aab /tmp/play.aab
+          fi
 
       - name: Verify hardened APK (+ bundle when built)
         run: |
-          ARGS=""
-          if [ -f /tmp/secure.apk.pkkey ]; then ARGS="--pk-key-file /tmp/secure.apk.pkkey"; fi
           python3 tools/verify.py --apk /tmp/secure.apk \
-            --config "config/${{ inputs.app }}.json" $ARGS
+            --config "config/${{ inputs.app }}.json"
           if [ -f /tmp/play.aab ]; then
             python3 tools/verify.py --apk /tmp/play.aab \
-              --config "config/${{ inputs.app }}.json"
+              --config "config/${{ inputs.app }}.json" --self-digest baseline
           fi
 
       - name: Upload hardened output to release
@@ -200,6 +208,36 @@ jobs:
             fi
           else
             echo "NOTE: pipeline R8 skipped (obfuscate off) - no secure APK mapping"
+          fi
+          # Optional Play bundle twin (output.aab_asset, when the primary
+          # output is the sideload apk): upload the hardened bundle under its
+          # own asset name + AGP deobfuscation map for Play Console.
+          if [ -n "$OUT_AAB_ASSET" ] && [ "$OUT_AAB_ASSET" != "$OUT_ASSET" ]; then
+            [ -f /tmp/play.aab ] || { echo "output.aab_asset set but no hardened bundle built"; exit 1; }
+            cp /tmp/play.aab "/tmp/$OUT_AAB_ASSET"
+            ls -l "/tmp/$OUT_AAB_ASSET"
+            gh release upload "$TAG" "/tmp/$OUT_AAB_ASSET" --repo "$OUT_REPO" --clobber
+            echo "uploaded $OUT_AAB_ASSET to $OUT_REPO@$TAG"
+            if [ -f /tmp/secure_play_pass.apk.mapping.txt ]; then
+              cp /tmp/secure_play_pass.apk.mapping.txt "/tmp/$OUT_AAB_ASSET.mapping.txt"
+              gh release upload "$TAG" "/tmp/$OUT_AAB_ASSET.mapping.txt" --repo "$OUT_REPO" --clobber
+              echo "uploaded $OUT_AAB_ASSET.mapping.txt (pipeline R8 map)"
+            else
+              rm -rf /tmp/agpmap_aab
+              if gh release download "$TAG" --repo "$OUT_REPO" \
+                  --pattern "*.aab.mapping.txt" --dir /tmp/agpmap_aab 2>/dev/null; then
+                M=$(ls /tmp/agpmap_aab/*.aab.mapping.txt 2>/dev/null | head -1)
+                if [ -n "$M" ]; then
+                  cp "$M" "/tmp/$OUT_AAB_ASSET.mapping.txt"
+                  gh release upload "$TAG" "/tmp/$OUT_AAB_ASSET.mapping.txt" --repo "$OUT_REPO" --clobber
+                  echo "uploaded $OUT_AAB_ASSET.mapping.txt (AGP minify map from plain build)"
+                else
+                  echo "WARN: no mapping available for $OUT_AAB_ASSET (Play crash stacks will be obfuscated)"
+                fi
+              else
+                echo "WARN: no mapping available for $OUT_AAB_ASSET (Play crash stacks will be obfuscated)"
+              fi
+            fi
           fi
 
   purge-logs:
