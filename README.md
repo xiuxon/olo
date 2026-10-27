@@ -4,8 +4,7 @@ Public CI runner repository. It holds the GitHub Actions workflows that build,
 harden, and test Android apps hosted in other repositories. Source code of the
 apps and of the hardening pipeline does **not** live here — only the workflows.
 
-> This repo must stay **public**: workflows run here because private-repo
-> Actions are billing-blocked on the free plan. Everything sensitive is passed
+> This repo must stay **public**: workflows run here. Everything sensitive is passed
 > through encrypted secrets; never commit keys, tokens, or keystores.
 
 ## Workflows
